@@ -20,11 +20,14 @@
 """PyTorch Qwen2MoE model."""
 
 import math
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch import nn
+
+import copy
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache, StaticCache
@@ -672,7 +675,7 @@ class Qwen2MoeDecoderLayer(GradientCheckpointingLayer):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
+        past_key_values: Optional[tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         output_router_logits: Optional[bool] = False,
         use_cache: Optional[bool] = False,
@@ -694,7 +697,7 @@ class Qwen2MoeDecoderLayer(GradientCheckpointingLayer):
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
-            past_key_values (`Cache`, *optional*): cached past key and value projection states
+            past_key_values (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
             cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
                 Indices depicting the position of the input sequence tokens in the sequence.
             position_embeddings (`tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
@@ -777,9 +780,36 @@ class Qwen2MoeModel(Qwen2MoePreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [Qwen2MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
+
+        # 获取你自定义的配置，如果不存在则为 None
+        layer_expert_counts: Optional[List[int]] = getattr(config, "layer_expert_counts", None)
+        if layer_expert_counts is None:
+            self.layers = nn.ModuleList(
+                [Qwen2MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            )
+            # raise ValueError("`layer_expert_counts` is not defined in the config for variable expert count model.")
+        else:
+            # 验证长度
+            if len(layer_expert_counts) != config.num_hidden_layers:
+                raise ValueError(
+                    f"layer_expert_counts length ({len(layer_expert_counts)}) must match "
+                    f"num_hidden_layers ({config.num_hidden_layers})"
+                )
+            
+            self.layers = nn.ModuleList()
+            
+            # 预先创建基础配置，避免在循环中重复deepcopy相同部分
+            base_layer_config = copy.deepcopy(config)
+            
+            for layer_idx in range(config.num_hidden_layers):
+                num_experts_for_this_layer = layer_expert_counts[layer_idx]
+                
+                # 只修改专家数量，其他配置保持不变
+                layer_config = copy.deepcopy(base_layer_config)
+                layer_config.num_experts = num_experts_for_this_layer
+                
+                self.layers.append(Qwen2MoeDecoderLayer(layer_config, layer_idx))
+
         self._attn_implementation = config._attn_implementation
         self.norm = Qwen2MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2MoeRotaryEmbedding(config=config)
@@ -821,6 +851,10 @@ class Qwen2MoeModel(Qwen2MoePreTrainedModel):
                     "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
                 )
                 use_cache = False
+
+        # TODO (joao): remove this exception in v4.56 -- it exists for users that try to pass a legacy cache
+        if not isinstance(past_key_values, (type(None), Cache)):
+            raise ValueError("The `past_key_values` should be either a `Cache` object or `None`.")
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
